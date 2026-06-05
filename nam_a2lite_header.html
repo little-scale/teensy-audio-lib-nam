@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>A2-Lite to C header</title>
+<style>
+  body{background:#e8e2d0; color:#222; font-family:Arial, Helvetica, sans-serif; font-size:14px;
+    margin:0; padding:40px; display:flex; justify-content:center}
+  .box{background:#f0ece0; border:1px solid #b3ac95; padding:24px; width:100%; max-width:460px}
+  h1{font-size:16px; font-weight:bold; margin:0 0 4px}
+  .sub{color:#6b6450; margin:0 0 20px}
+  label{display:block; margin:0 0 4px; color:#6b6450; font-size:13px}
+  input[type=file]{display:block; margin:0 0 16px; font-size:13px}
+  input[type=text]{font-family:inherit; font-size:13px; padding:6px 8px; border:1px solid #8a8470;
+    background:#fff; width:100%; margin:0 0 16px; box-sizing:border-box}
+  button{font-family:inherit; font-size:13px; padding:7px 14px; border:1px solid #8a8470;
+    background:#ddd6c2; color:#222; cursor:pointer}
+  button:disabled{color:#999; border-color:#c0bba6; background:#e6e1d2; cursor:not-allowed}
+  #status{margin-top:16px; min-height:18px}
+  #status.bad{color:#a32020}
+</style>
+</head>
+<body>
+<div class="box">
+  <h1>A2-Lite to C header</h1>
+  <p class="sub">Bakes the 3-channel A2-Lite weights from an A2 .nam into nam_weights.h for the Teensy core.</p>
+
+  <label for="file">Model (.nam)</label>
+  <input type="file" id="file" accept=".nam,application/json">
+
+  <label for="name">C array name</label>
+  <input type="text" id="name" value="g_namWeights">
+
+  <button id="dl" disabled>Download nam_weights.h</button>
+  <div id="status">No file loaded.</div>
+</div>
+
+<script>
+const KS=[6,6,6,6,6,6,6,6,6,6,6,6,6,6,15,15,6,6,6,6,6,6,6];
+const DS=[1,3,7,17,41,101,239,1,3,7,17,41,101,239,1,13,1,3,7,17,41,101,239];
+const HEAD_K=16;
+let flat=null, srcName="", chInFile="", sampleRate=48000;
+const $=id=>document.getElementById(id);
+function status(ok,msg){ const s=$("status"); s.textContent=msg; s.className=ok?"":"bad"; }
+
+function expectedCount(C){
+  let n=C;
+  for(const K of KS){ n += K*C*C + C; n += C; n += C*C + C; }
+  n += HEAD_K*C + 1; n += 1; return n;
+}
+
+// 8ch slimmable -> leading-3ch slice (canonical loader order)
+function sliceTo3(w8){
+  let p=0; const out=[]; const take=()=>w8[p++];
+  const conv1d=(inF,outF,inS,outS,K)=>{
+    for(let i=0;i<outF;i++)for(let j=0;j<inF;j++)for(let k=0;k<K;k++){const v=take();if(i<outS&&j<inS)out.push(v);}
+    for(let i=0;i<outF;i++){const v=take();if(i<outS)out.push(v);}};
+  const conv1x1=(inF,outF,inS,outS,b)=>{
+    for(let i=0;i<outF;i++)for(let j=0;j<inF;j++){const v=take();if(i<outS&&j<inS)out.push(v);}
+    if(b)for(let i=0;i<outF;i++){const v=take();if(i<outS)out.push(v);}};
+  conv1x1(1,8,1,3,false);
+  for(const K of KS){conv1d(8,8,3,3,K);conv1x1(1,8,1,3,false);conv1x1(8,8,3,3,true);}
+  for(let j=0;j<8;j++)for(let k=0;k<HEAD_K;k++){const v=take();if(j<3)out.push(v);}
+  out.push(take());out.push(take()); return out;
+}
+
+function process(doc){
+  // unwrap SlimmableContainer -> 3ch submodel
+  if(doc.architecture==="SlimmableContainer"){
+    let picked=null;
+    for(const sm of (doc.config && doc.config.submodels || [])){
+      const m=sm.model, ch=m && m.config && m.config.layers && m.config.layers[0].channels;
+      if(ch===3) picked=m;
+    }
+    if(!picked) throw new Error("no 3-channel (A2-Lite) submodel in container");
+    doc=picked;
+  }
+  if(doc.architecture!=="WaveNet")
+    throw new Error("architecture is "+doc.architecture+", expected WaveNet");
+  const la=doc.config.layers[0], ch=la.channels, w=(doc.weights||[]).map(Number);
+  const sr=doc.sample_rate||48000;
+  // sanity on shape
+  const shapeOk = JSON.stringify(la.kernel_sizes)===JSON.stringify(KS)
+               && JSON.stringify(la.dilations)===JSON.stringify(DS);
+
+  let out;
+  if(ch===3){
+    if(w.length!==expectedCount(3)) throw new Error("3ch model has "+w.length+" weights, expected "+expectedCount(3));
+    out=w;
+  } else if(ch===8){
+    if(!la.slimmable) throw new Error("8-channel model is not slimmable — cannot make A2-Lite");
+    if(w.length!==expectedCount(8)) throw new Error("8ch model has "+w.length+" weights, expected "+expectedCount(8));
+    out=sliceTo3(w);
+    if(out.length!==expectedCount(3)) throw new Error("slice produced "+out.length+", expected "+expectedCount(3));
+  } else {
+    throw new Error("channels="+ch+", expected 3 or 8");
+  }
+  if(!out.every(Number.isFinite)) throw new Error("weights contain NaN/Inf");
+  return {flat:out, ch, sr, shapeOk};
+}
+
+// %.9g-style float literal
+function fmtF(v){
+  if(v===0) return "0f";
+  let s=v.toPrecision(9);
+  if(s.indexOf("e")>=0){
+    let parts=s.split("e"), m=parts[0];
+    if(m.indexOf(".")>=0) m=m.replace(/0+$/,"").replace(/\.$/,"");
+    s=m+"e"+parts[1];
+  } else if(s.indexOf(".")>=0){
+    s=s.replace(/0+$/,"").replace(/\.$/,"");
+  }
+  return s+"f";
+}
+
+function buildHeader(arr, name, src, ch, sr){
+  const srf = Number.isInteger(sr) ? sr+".0" : String(sr);
+  let s="";
+  s+="// Auto-generated by nam_a2lite_header.html — do not edit.\n";
+  s+="// source: "+src+"  channels(in file)="+ch+"  sample_rate="+sr+"\n";
+  s+="#pragma once\n#include <cstdint>\n\n";
+  s+="static constexpr float kNamSampleRate = "+srf+"f;\n";
+  s+="static constexpr unsigned kNamWeightCount = "+arr.length+";\n";
+  s+="static const float "+name+"["+arr.length+"] = {\n";
+  for(let i=0;i<arr.length;i+=8)
+    s+="  "+arr.slice(i,i+8).map(fmtF).join(", ")+",\n";
+  s+="};\n";
+  return s;
+}
+
+function handle(file){
+  const fr=new FileReader();
+  fr.onload=()=>{
+    try{
+      const r=process(JSON.parse(fr.result));
+      flat=r.flat; srcName=file.name; chInFile=r.ch; sampleRate=Math.round(r.sr);
+      status(true, file.name+": "+flat.length+" weights, "+sampleRate+" Hz, "
+        +(chInFile===8?"sliced 8\u21923":"3ch")+(r.shapeOk?"":" (warning: shape mismatch)")+". Ready.");
+      $("dl").disabled=false;
+    }catch(e){ flat=null; $("dl").disabled=true; status(false,"Error: "+e.message); }
+  };
+  fr.onerror=()=>status(false,"Could not read file.");
+  fr.readAsText(file);
+}
+
+$("file").onchange=e=>{ if(e.target.files[0]) handle(e.target.files[0]); };
+$("dl").onclick=()=>{
+  if(!flat) return;
+  const name=($("name").value||"g_namWeights").trim();
+  const text=buildHeader(flat, name, srcName, chInFile, sampleRate);
+  const url=URL.createObjectURL(new Blob([text],{type:"text/plain"}));
+  const a=document.createElement("a"); a.href=url; a.download="nam_weights.h"; a.click();
+  URL.revokeObjectURL(url);
+};
+</script>
+</body>
+</html>
